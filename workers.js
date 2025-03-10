@@ -3,6 +3,8 @@
 // - TELEGRAM_CHAT_ID: Chat/channel ID to store files
 // - FILES: KV namespace binding
 
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB (Telegram's limit)
+
 addEventListener('fetch', event => {
     event.respondWith(handleRequest(event.request));
   });
@@ -25,81 +27,82 @@ addEventListener('fetch', event => {
     return jsonError('Not found', 404);
   }
   
-  async function handleUpload(request) {
-    try {
-      // Validate Content-Type header
-      const contentType = request.headers.get('Content-Type') || '';
-      if (!contentType.startsWith('multipart/form-data')) {
-        return jsonError('Invalid Content-Type. Must be multipart/form-data', 400);
+async function handleUpload(request) {
+  try {
+    const contentType = request.headers.get('Content-Type') || '';
+    if (!contentType.startsWith('multipart/form-data')) {
+      return jsonError('Invalid Content-Type. Must be multipart/form-data', 400);
+    }
+
+    const formData = await request.formData();
+    const files = formData.getAll('files[]').filter(f => f instanceof File);
+    
+    if (files.length === 0) {
+      return jsonError('No valid files uploaded', 400);
+    }
+
+    const results = [];
+    for (const file of files) {
+      if (file.size > MAX_FILE_SIZE) {
+        return jsonError(`File ${file.name} exceeds 50MB limit`, 400);
       }
-  
-      // Parse form data
-      let formData;
-      try {
-        formData = await request.formData();
-      } catch (e) {
-        return jsonError('Malformed multipart form data', 400);
-      }
-  
-      // Get file from form data
-      const file = formData.get('files[]');
-      if (!file || !(file instanceof File)) {
-        return jsonError('No valid file uploaded', 400);
-      }
-  
-      // Generate public ID with extension
+
       const publicId = generatePublicId(file.name);
-      const hashPart = publicId.split('.')[0]; // Get the random part before extension
-  
-      // Send file to Telegram
+      const hashPart = publicId.split('.')[0];
+
+      // Use sendDocument for all file types
       const formDataTelegram = new FormData();
       formDataTelegram.append('chat_id', TELEGRAM_CHAT_ID);
-      formDataTelegram.append('document', file, file.name);
-  
+      formDataTelegram.append('document', 
+        new Blob([await file.arrayBuffer()], { type: file.type }), 
+        file.name
+      );
+
       const sendResponse = await fetch(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
         { method: 'POST', body: formDataTelegram }
       );
-  
+
       const sendResult = await sendResponse.json();
       
       if (!sendResult.ok) {
-        console.error('Telegram API error:', sendResult.description);
-        return jsonError('Upload failed', 500);
+        return jsonError(`Telegram API error: ${sendResult.description}`, 500);
       }
-  
-      // Store mapping between public ID (with extension) and Telegram file ID
-      await FILES.put(publicId, sendResult.result.document.file_id);
-  
-      // Build response with /f/ route
-      const publicUrl = new URL(`/f/${publicId}`, request.url).href;
-      const responseBody = {
-        success: true,
-        files: [{
-          hash: hashPart,
-          name: file.name,
-          url: publicUrl,
-          size: sendResult.result.document.file_size
-        }]
-      };
-  
-      return new Response(JSON.stringify(responseBody), {
-        headers: { 'Content-Type': 'application/json' }
+
+      // Extract file info from document field
+      const mediaObject = sendResult.result.document;
+      if (!mediaObject?.file_id) {
+        return jsonError('Failed to retrieve file ID from Telegram', 500);
+      }
+
+      await FILES.put(publicId, mediaObject.file_id);
+
+      results.push({
+        hash: hashPart,
+        name: file.name,
+        url: `${new URL(request.url).origin}/f/${publicId}`,
+        size: mediaObject.file_size
       });
-  
-    } catch (error) {
-      console.error('Upload error:', error);
-      return jsonError('Internal server error', 500);
     }
+
+    return new Response(JSON.stringify({
+      success: true,
+      files: results
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    return jsonError('Internal server error', 500);
   }
+}
 
 async function handleDownload(request, publicId) {
   try {
-    // Get Telegram file ID from KV using public ID with extension
     const fileId = await FILES.get(publicId);
     if (!fileId) return jsonError('File not found', 404);
 
-    // Get file path from Telegram API
     const fileResponse = await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile`,
       {
@@ -112,17 +115,12 @@ async function handleDownload(request, publicId) {
     const fileData = await fileResponse.json();
     if (!fileData.ok) throw new Error('Telegram API error');
 
-    // Stream file from Telegram
     const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`;
     const response = await fetch(fileUrl);
 
-    // Get original filename from Telegram's response
-    const filename = fileData.result.file_path.split('/').pop();
-
-    // Set headers with proper filename and caching
     const headers = new Headers(response.headers);
-    headers.set('Content-Disposition', `attachment; filename="${filename}"`);
-    headers.set('Cache-Control', 'public, max-age=31536000'); // 1 year
+    headers.set('Content-Disposition', `attachment; filename="${publicId}"`);
+    headers.set('Cache-Control', 'public, max-age=31536000');
 
     return new Response(response.body, { headers });
 
@@ -132,16 +130,13 @@ async function handleDownload(request, publicId) {
   }
 }
 
-// Helper functions
 function generatePublicId(filename) {
-  // Generate 8-character random string with mixed case
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let id = '';
   for (let i = 0; i < 8; i++) {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
 
-  // Append file extension if present
   const lastDotIndex = filename.lastIndexOf('.');
   if (lastDotIndex !== -1 && lastDotIndex < filename.length - 1) {
     const ext = filename.slice(lastDotIndex);
