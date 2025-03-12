@@ -4,47 +4,52 @@
 // - FILES: KV namespace binding
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB (Telegram's limit)
+const TELEGRAM_API_BASE = 'https://api.telegram.org';
 
 addEventListener('fetch', event => {
-    event.respondWith(handleRequest(event.request));
-  });
-  
-  async function handleRequest(request) {
-    const url = new URL(request.url);
-  
-    // Upload route: POST /upload
-    if (url.pathname === '/upload' && request.method === 'POST') {
-      return handleUpload(request);
-    }
-  
-    // Download route: GET /f/{random_id}.{ext}
-    else if (url.pathname.startsWith('/f/')) {
-      const publicId = url.pathname.slice(3); // Remove '/f/' prefix
-      return handleDownload(request, publicId);
-    }
-  
-    // Default 404
-    return jsonError('Not found', 404);
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // Upload route: POST /upload
+  if (path === '/upload' && request.method === 'POST') {
+    return handleUpload(request, url.origin);
   }
-  
-async function handleUpload(request) {
+
+  // Download route: GET /f/{random_id}.{ext}
+  if (path.startsWith('/f/')) {
+    const publicId = path.slice(3); // Remove '/f/' prefix
+    return handleDownload(publicId);
+  }
+
+  // Default 404
+  return jsonResponse({ success: false, error: 'Not found' }, 404);
+}
+
+async function handleUpload(request, origin) {
   try {
     const contentType = request.headers.get('Content-Type') || '';
+    
     if (!contentType.startsWith('multipart/form-data')) {
-      return jsonError('Invalid Content-Type. Must be multipart/form-data', 400);
+      return jsonResponse({ 
+        success: false, 
+        error: 'Invalid Content-Type. Must be multipart/form-data' 
+      }, 400);
     }
 
     const formData = await request.formData();
     const files = formData.getAll('files[]').filter(f => f instanceof File);
     
     if (files.length === 0) {
-      return jsonError('No valid files uploaded', 400);
+      return jsonResponse({ success: false, error: 'No valid files uploaded' }, 400);
     }
 
-    const results = [];
-    for (const file of files) {
+    const results = await Promise.all(files.map(async file => {
       if (file.size > MAX_FILE_SIZE) {
-        return jsonError(`File ${file.name} exceeds 50MB limit`, 400);
+        throw new Error(`File ${file.name} exceeds 50MB limit`);
       }
 
       const publicId = generatePublicId(file.name);
@@ -59,63 +64,56 @@ async function handleUpload(request) {
       );
 
       const sendResponse = await fetch(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
+        `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendDocument`,
         { method: 'POST', body: formDataTelegram }
       );
 
       const sendResult = await sendResponse.json();
       
       if (!sendResult.ok) {
-        return jsonError(`Telegram API error: ${sendResult.description}`, 500);
+        throw new Error(`Telegram API error: ${sendResult.description}`);
       }
 
       // Extract file info from document field
       const mediaObject = sendResult.result.document;
       if (!mediaObject?.file_id) {
-        return jsonError('Failed to retrieve file ID from Telegram', 500);
+        throw new Error('Failed to retrieve file ID from Telegram');
       }
 
       await FILES.put(publicId, mediaObject.file_id);
 
-      results.push({
+      return {
         hash: hashPart,
         name: file.name,
-        url: `${new URL(request.url).origin}/f/${publicId}`,
+        url: `${origin}/f/${publicId}`,
         size: mediaObject.file_size
-      });
-    }
+      };
+    }));
 
-    return new Response(JSON.stringify({
-      success: true,
-      files: results
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return jsonResponse({ success: true, files: results });
 
   } catch (error) {
     console.error('Upload error:', error);
-    return jsonError('Internal server error', 500);
+    return jsonResponse({ 
+      success: false, 
+      error: error.message || 'Internal server error' 
+    }, error.message.includes('exceeds') ? 400 : 500);
   }
 }
 
-async function handleDownload(request, publicId) {
+async function handleDownload(publicId) {
   try {
     const fileId = await FILES.get(publicId);
-    if (!fileId) return jsonError('File not found', 404);
+    if (!fileId) {
+      return jsonResponse({ success: false, error: 'File not found' }, 404);
+    }
 
-    const fileResponse = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_id: fileId })
-      }
-    );
+    const fileData = await fetchTelegramFile(fileId);
+    if (!fileData.ok) {
+      throw new Error('Telegram API error');
+    }
 
-    const fileData = await fileResponse.json();
-    if (!fileData.ok) throw new Error('Telegram API error');
-
-    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`;
+    const fileUrl = `${TELEGRAM_API_BASE}/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`;
     const response = await fetch(fileUrl);
 
     const headers = new Headers(response.headers);
@@ -126,8 +124,21 @@ async function handleDownload(request, publicId) {
 
   } catch (error) {
     console.error('Download error:', error);
-    return jsonError('Download failed', 500);
+    return jsonResponse({ success: false, error: 'Download failed' }, 500);
   }
+}
+
+async function fetchTelegramFile(fileId) {
+  const response = await fetch(
+    `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/getFile`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_id: fileId })
+    }
+  );
+  
+  return response.json();
 }
 
 function generatePublicId(filename) {
@@ -146,11 +157,8 @@ function generatePublicId(filename) {
   return id;
 }
 
-function jsonError(message, status) {
-  return new Response(JSON.stringify({
-    success: false,
-    error: message
-  }), {
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
     status,
     headers: { 'Content-Type': 'application/json' }
   });
